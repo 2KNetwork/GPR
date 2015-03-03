@@ -164,15 +164,20 @@
      (opengl:gl-clear opengl:*gl-color-buffer-bit*)
      (opengl:gl-clear opengl:*gl-depth-buffer-bit*)
      (opengl:gl-depth-func opengl:*gl-less*)
-     (opengl:gl-enable opengl:*gl-depth-test*)
+     ;(opengl:gl-enable opengl:*gl-depth-test*)
      ,@body
      (opengl:gl-flush)))
 
 (defvar *inside-opengl-block* nil)
+(defvar *bases-stack*)
+(defvar *base*)
+(defvar *vertex-transformation*)
 
 (defmacro opengl-interface (slots (&key (display (lambda (canvas &rest args) (declare (ignore canvas args))))
                                         (mouse-press-primary (lambda (canvas point) (declare (ignore canvas point))))
-                                        (mouse-press-secondary (lambda (canvas point) (declare (ignore canvas point))))))
+                                        (mouse-press-secondary (lambda (canvas point) (declare (ignore canvas point))))
+                                        (vertex-transformation #'base-vertex-transformation)
+                                        (key-press (lambda (canvas char) (declare (ignore canvas char))))))
     (with-unique-names (opengl-canvas opengl-interface)
       `(progn
          (defclass ,opengl-canvas (opengl:opengl-pane)
@@ -182,16 +187,21 @@
            (:panes (canvas ,opengl-canvas
                            :configuration (list :rgba t :depth-buffer 16)
                            :display-callback (lambda  (canvas &rest args)
-                                               (declare (ignore args))
+                                               (declare (ignore args) (ignorable canvas))
                                                (render-on (canvas)
-                                                 (let ((*inside-opengl-block* t))
+                                                 (let ((*inside-opengl-block* t)
+                                                       (*bases-stack* nil)
+                                                       (*base* (list (point 0 0) (vect 1 0) (vect 0 1)))
+                                                       (*vertex-transformation* ,vertex-transformation))
                                                    (funcall ,display canvas))))
                            :resize-callback 'resize-canvas
                            :input-model `(((:button-1 :press) ,(lambda (canvas x y)
                                                                  (funcall ,mouse-press-primary canvas (point x (- (canvas-height canvas) y)))))
                                           ((:button-3 :press) ,(lambda (canvas x y)
-                                                                 (funcall ,mouse-press-secondary canvas (point x (- (canvas-height canvas) y))))))
-                                              ;(:character ,(eval character-callback))))
+                                                                 (funcall ,mouse-press-secondary canvas (point x (- (canvas-height canvas) y)))))
+                                          (:character ,(lambda (canvas x y char)
+                                                         (declare (ignore x y))
+                                                         (funcall ,key-press canvas char))))
                            :min-width 800
                            :min-height 600))
            (:default-initargs :title "OpenGL interface"))
@@ -203,6 +213,7 @@
   `(opengl-interface 
     ()
     (:display (lambda (canvas)
+                (declare (ignorable canvas))
                 ,@body))))
 
 
@@ -212,7 +223,7 @@
 
 (defun color (point)
   (unless *inside-opengl-block*
-    (error "The function color must be called inside opengl block."))
+    (error "The function color must be called inside opengl macros."))
   (unless (= (dimension point) 3)
     (error "The point has to have dimension three."))
   (unless (every (lambda (c) (<= 0 c 1)) (coordinates point))
@@ -230,23 +241,22 @@
 (defmacro polygon (&body body)
   `(progn
      (unless *inside-opengl-block*
-       (error "Makro polygon must be used inside opengl block"))
+       (error "Macro polygon must be used inside opengl macros."))
      (opengl:gl-begin opengl:*gl-polygon*)
      (let ((*inside-polygon-block* t))
        ,@body)
      (opengl:gl-end)))
 
-
-(defmethod vertex ((point point))
+(defmethod vertex ((vertex point))
   (unless *inside-polygon-block*
-    (error "Function send-point must be called inside polygon block."))
-  (let ((dim (dimension point)))
+    (error "The function must be called inside macro polygon."))
+  (let ((dim (dimension vertex)))
     (unless (<= 2 dim 3)
       (error "The point must have dimension two or three."))
     (if (= dim 2)
-        (opengl:gl-vertex2-d (coerce (x point) 'double-float) (coerce (y point) 'double-float))
-      (opengl:gl-vertex3-d (coerce (x point) 'double-float) (coerce (y point) 'double-float) (coerce (z point) 'double-float)))))
-
+        (let ((vertex-t (funcall *vertex-transformation* vertex)))
+          (opengl:gl-vertex2-d (coerce (x vertex-t) 'double-float) (coerce (y vertex-t) 'double-float)))
+      (opengl:gl-vertex3-d (coerce (x vertex) 'double-float) (coerce (y vertex) 'double-float) (coerce (z vertex) 'double-float)))))
 
 (defun get-color ()
   (let ((vect (opengl:make-gl-vector :float 4)))
@@ -255,69 +265,46 @@
            (opengl:gl-vector-aref vect 1)
            (opengl:gl-vector-aref vect 2))))
 
-#|
-(opengl-interface 
- ((color :initform :red))
- (:display 
-  (lambda (canvas)
-    (with-slots (color) canvas
-      (color (color-point color))
-      (polygon
-        (vertex (point 0 0))
-        (vertex (point 500 0))
-        (vertex (point 0 100)))))
-  :mouse-press-primary
-   (lambda (canvas point)
-     (with-slots (color) canvas
-       (if (eql color :red)
-           (setf color :blue)
-         (setf color :red))
-       (invalidate canvas)))))
 
-(opengl-interface 
- ((points :initform nil)
-  (color :initform :red))
- (:display 
-  (lambda (canvas)
-    (with-slots (points color) canvas
-      (color (color-point color))
-      (polygon
-        (dolist (point points)
-          (vertex point)))))
-  :mouse-press-primary
-   (lambda (canvas point)
-     (with-slots (points) canvas
-       (push-end point points)
-       (invalidate canvas)))
-   :mouse-press-secondary
-   (lambda (canvas point)
-     (with-slots (color) canvas
-       (if (eql color :red)
-           (setf color :blue)
-         (setf color :red))
-       (invalidate canvas)))))
+(defmethod base-vertex-transformation ((point point))
+  (plus (first *base*)
+        (plus (mult (x point) (second *base*))
+              (mult (y point) (third *base*)))))
+
+(defmethod c-s-translate ((vector vect))
+  (when *inside-polygon-block*
+    (error "The function can not be used inside macro polygon."))
+  (setf (first *base*) (plus (first *base*) 
+                             (plus (mult (x vector) (second *base*))
+                                   (mult (y vector) (third *base*))))))
+
+(defun c-s-rotate (angle)
+  (when *inside-polygon-block*
+    (error "The function can not be used inside macro polygon."))
+  (setf (second *base*) (rotate (second *base*) angle)
+        (third *base*) (rotate (third *base*) angle)))
+
+(defun c-s-scale (x-coef y-coef)
+  (when *inside-polygon-block*
+    (error "The function can not be used inside macro polygon."))
+  (setf (second *base*) (mult x-coef (second *base*))
+        (third *base*) (mult y-coef (third *base*))))
+
+(defun base-push ()
+  (push (copy-list *base*) *bases-stack*))
+
+(defun base-pop ()
+  (setf *base* (pop *bases-stack*)))
+
+(defmacro with-c-s-pushed (&body body)
+  `(progn
+     (base-push)
+     (unwind-protect 
+         (progn
+           ,@body)
+       (base-pop))))
+     
 
 
-(opengl
-  (color (color-point :red))
-  (polygon
-    (vertex (point 0 0))
-    (vertex (point 500 0))
-    (vertex (point 0 100))))
-
-(opengl
-  (color (point 1 0.5 0))
-  (let ((color (get-color)))
-    (format t "r: ~a g: ~a b: ~a~%" (x color) (y color) (z color))))
-
-(opengl
-  (color (color-point :red))
-  (polygon
-    (vertex (point 0 0))
-    (vertex (plus (point 200 0) (minus (point 500 200) (point 200 200))))
-    (vertex (plus (point 0 0) (rotate (plus (mult 2 (vect 25 0))
-                                                (vect 50 0))
-                                          (/ pi 2))))))
-|#
 
 
